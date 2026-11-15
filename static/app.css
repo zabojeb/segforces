@@ -263,6 +263,13 @@ table.problems tr.ready td:first-child { box-shadow: inset 3px 0 0 var(--warn); 
 .tag.c { color: #8ab4ff; border-color: rgba(138, 180, 255, .3); }
 :root[data-theme="light"] .tag.bash { color: #0f7a43; }
 :root[data-theme="light"] .tag.c { color: #1f5fcc; }
+.solved-cell { width: 64px; }
+.solved-by {
+  display: inline-flex; align-items: center; gap: 4px; white-space: nowrap;
+  font: 600 12px var(--mono); color: var(--text-2); font-variant-numeric: tabular-nums;
+}
+.solved-by svg { width: 12px; height: 12px; opacity: .7; }
+.solved-by.none { color: var(--text-3); }
 .pts-badge {
   display: inline-block; min-width: 36px; text-align: center; padding: 2px 8px; border-radius: 999px;
   font: 700 12px var(--mono); font-variant-numeric: tabular-nums;

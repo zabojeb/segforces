@@ -91,6 +91,7 @@
   const vname = (v) => VERDICTS[v] || v || '';
 
   const ICON = {
+    user: '<svg viewBox="0 0 24 24" fill="currentColor"><circle cx="12" cy="8" r="4"/><path d="M4 20a8 8 0 0 1 16 0Z"/></svg>',
     play: '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M7 4.5v15a1 1 0 0 0 1.5.86l12-7.5a1 1 0 0 0 0-1.72l-12-7.5A1 1 0 0 0 7 4.5Z"/></svg>',
     send: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V5M5 12l7-7 7 7"/></svg>',
     stop: '<svg viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>',
@@ -485,7 +486,7 @@
   // -------------------------------------------------------------------------
   function parseRoute() {
     const h = decodeURIComponent(location.hash.replace(/^#/, '')) || '/';
-    const m = h.match(/^\/p\/(Session\d+\/[\w.-]+)(?:\/(statement|tests|subs|chat))?$/);
+    const m = h.match(/^\/p\/((?:Session\d+|Project)\/[\w.-]+)(?:\/(statement|tests|subs|chat))?$/);
     if (m) return { view: 'task', key: m[1], tab: m[2] };
     if (h.startsWith('/status')) return { view: 'status' };
     if (h.startsWith('/leaderboard')) return { view: 'leaderboard' };
@@ -554,6 +555,8 @@
     return judgeSyncing;
   }
 
+  const isProjectKey = (key) => typeof key === 'string' && key.startsWith('Project/');
+
   function taskState(t) {
     const j = t.judge;
     const l = t.local;
@@ -572,7 +575,8 @@
     let earned = 0;
     let points = 0;
     let solved = 0;
-    const tasks = allTasksFlat();
+    // Projects have no grader and are graded separately, so they stay out of the totals and rank.
+    const tasks = allTasksFlat().filter((t) => !t.project);
     for (const t of tasks) {
       points += t.points || 0;
       if (taskState(t) === 'solved') {
@@ -796,7 +800,7 @@
         <section class="session ${isCollapsed ? 'collapsed' : ''}" data-session="${s.name}">
           <div class="session-head" data-toggle="${s.name}">
             <span class="chev">▾</span>
-            <h2>Сессия ${s.num}</h2>
+            <h2>${s.project ? 'Проект' : `Сессия ${s.num}`}</h2>
             ${dl ? `<span class="dl ${dl.cls}" title="${esc(dl.title)}">⏰&nbsp; ${esc(dl.text)}</span>` : ''}
             <span class="spacer"></span>
             <div class="bar"><i style="width:${pct.toFixed(1)}%"></i></div>
@@ -856,6 +860,7 @@
       <td><div class="ptitle">${esc(t.title)}</div><div class="pname">${esc(t.name)}</div></td>
       <td class="hide-sm"><span class="tag ${kind}">${kind === 'bash' ? 'bash' : 'C'}</span></td>
       <td><span class="pts-badge ${diffClass(t.points)}">${t.points || '—'}</span></td>
+      <td class="hide-sm solved-cell">${solvedByHtml(t.name)}</td>
       <td class="hide-sm" title="Последний локальный прогон открытых тестов">${localCell}</td>
       <td title="Последняя проверка грейдером (скрытые тесты)">${judgeCell}</td>
       <td class="hide-sm">${dl ? `<span class="dl ${st === 'solved' ? '' : dl.cls}" title="${esc(dl.title)}">${esc(dl.text)}</span>` : ''}</td>
@@ -927,6 +932,21 @@
   function lbScore(name) {
     const me = lbMe();
     return me && me.scores ? me.scores[name] : undefined;
+  }
+
+  // How many students of the course sheet got points for the task (like "×N" on Codeforces).
+  function lbSolvedBy(name) {
+    const lb = S.leaderboard;
+    if (!lb || !lb.tasks.includes(name)) return null;
+    const ranked = lb.rows.filter((r) => !r.reference && !r.meta);
+    return { solved: ranked.filter((r) => (r.scores[name] || 0) > 0).length, total: ranked.length };
+  }
+
+  function solvedByHtml(name, long) {
+    const s = lbSolvedBy(name);
+    if (!s) return '';
+    const title = `Решили ${s.solved} из ${s.total} по таблице курса`;
+    return `<span class="solved-by ${s.solved ? '' : 'none'}" title="${esc(title)}">${ICON.user}${long ? `Решили ${s.solved} из ${s.total}` : `×${s.solved}`}</span>`;
   }
 
   function lbSessions(lb) {
@@ -1704,11 +1724,12 @@
         <h1 class="st-title"><span class="letter">${t.snum}${t.letter}.</span>${esc(t.title)}</h1>
         <div class="st-meta">
           <span class="pts-badge ${diffClass(t.points)}">${t.points || '?'} балл.</span>
+          <span id="st-solved">${solvedByHtml(t.name, true)}</span>
           ${kindTag}
           ${dl ? `<span class="dl ${dl.cls}" title="${esc(dl.title)}">⏰ ${esc(dl.text)}</span>` : ''}
           <span class="sep"></span>
           <span class="dim mono" style="font-size:12px">${esc(t.key)}</span>
-          ${runner.docker ? '<span class="tag" title="Тесты запускаются в Docker">🐳 docker</span>' : runner.script ? '<span class="tag" title="Тесты запускаются прямо на твоём Mac">💻 локально</span>' : ''}
+          ${runner.project ? '<span class="tag" title="▶ запускает make test в папке проекта">🛠 make test</span>' : runner.docker ? '<span class="tag" title="Тесты запускаются в Docker">🐳 docker</span>' : runner.script ? '<span class="tag" title="Тесты запускаются прямо на твоём компьютере">💻 локально</span>' : ''}
         </div>
         ${exp.length || (t.make_targets || []).length ? `<div class="st-files">
           ${exp.length ? `<div>Файлы решения: ${exp.map((e) => e.exists
@@ -1718,6 +1739,12 @@
         </div>` : ''}
       </div>
       <div class="md" id="statement-md">${md(cleanStatement(t.statement || '_Условие не найдено_'))}</div>`;
+    if (!S.leaderboard) {
+      loadLeaderboard(false).then(() => {
+        const el = $('#st-solved');
+        if (el && S.task === t) el.innerHTML = solvedByHtml(t.name, true);
+      }).catch(() => {});
+    }
     highlightIn(pane);
     pane.onclick = (e) => {
       const b = e.target.closest('[data-create]');
@@ -2575,6 +2602,7 @@
   function defaultCommand() {
     const t = S.task;
     if (!t) return '';
+    if (t.project) return 'make && ./huffman -h';
     if (t.kind === 'c') {
       const target = (t.make_targets || [])[0] || 'build';
       const make = `make -f Makefile.Student ${target}`;
@@ -2595,20 +2623,22 @@
     if (pane.dataset.key === S.key) return;
     pane.dataset.key = S.key;
     const docker = S.env && S.env.docker && S.env.docker.running;
-    const mode = prefs.consoleMode || 'docker';
+    const project = isProjectKey(S.key);
+    // Projects build with gcc/make on the host; the fallback Docker image has no compiler.
+    const mode = project ? 'local' : (prefs.consoleMode || 'docker');
     pane.innerHTML = `
       <div class="console">
         <div class="console-bar">
           <label class="cmd-input"><span>$</span><input id="cmd" spellcheck="false" autocomplete="off" value="${esc(defaultCommand())}"></label>
           <select class="sel" id="cmd-mode" title="Где выполнить">
             <option value="docker" ${mode === 'docker' ? 'selected' : ''}>🐳 Linux (Docker)</option>
-            <option value="local" ${mode === 'local' ? 'selected' : ''}>💻 macOS локально</option>
+            <option value="local" ${mode === 'local' ? 'selected' : ''}>💻 локально</option>
           </select>
           <button class="btn primary" id="cmd-run">${ICON.play} Выполнить</button>
         </div>
         <details class="stdin-box"><summary class="dim" style="font-size:12px;cursor:pointer;padding-top:6px">stdin (ввод для программы)</summary><textarea id="cmd-stdin" placeholder="То, что программа прочитает через read / scanf"></textarea></details>
         <div class="console-out" id="console-out">
-          <div class="dim" style="font-size:12.5px;padding:10px 0">Команда выполняется в <b>копии</b> папки задачи — твои файлы не изменятся. ${docker ? 'В Docker окружение как у тестов (Debian, bash 5, GNU-утилиты).' : 'Docker не запущен — доступен режим macOS (bash 3.2 и BSD-утилиты, поведение может отличаться от тестов).'}
+          <div class="dim" style="font-size:12.5px;padding:10px 0">Команда выполняется в <b>копии</b> папки ${project ? 'проекта' : 'задачи'} — твои файлы не изменятся. ${project ? 'Примеры: <code>make && ./huffman -h</code>, <code>make && ./huffman -a -f ReadMe.md -o r.bin && ./huffman -d -f r.bin -o out.md && cmp ReadMe.md out.md</code>, <code>valgrind --leak-check=full ./huffman -h</code></div>' : ''}${project ? '<div hidden>' : ''}${docker ? 'В Docker окружение как у тестов (Debian, bash 5, GNU-утилиты).' : 'Docker не запущен — доступен режим macOS (bash 3.2 и BSD-утилиты, поведение может отличаться от тестов).'}
           Примеры: <code>./script.sh 5</code>, <code>make -f Makefile.Student build && ./prog</code>, <code>mkdir t && touch t/a.TXT && ./file_sorter.sh; find .</code></div>
         </div>
       </div>`;
@@ -2624,7 +2654,7 @@
         e.target.value = hist[i];
       }
     });
-    $('#cmd-mode').addEventListener('change', (e) => { prefs.consoleMode = e.target.value; savePrefs(); });
+    $('#cmd-mode').addEventListener('change', (e) => { if (!project) { prefs.consoleMode = e.target.value; savePrefs(); } });
   }
 
   async function runConsole() {
@@ -2698,23 +2728,28 @@
     const anySelectable = pf.files.some((f) => !f.protected);
     const body = $('#sub-body', m.el);
     body.innerHTML = `
-      <div class="muted">Задача <b>${esc(t.snum + t.letter)}. ${esc(t.title)}</b> → коммит в <code>master</code> и push на GitHub. Грейдер проверит её на скрытых тестах.</div>
+      ${pf.project
+        ? `<div class="muted">Проект <b>${esc(t.title)}</b> → коммит в <code>${esc(pf.branch)}</code> и push в <code>${esc(pf.remote || 'origin')}</code>. Грейдера нет — проект проверяет ментор.</div>`
+        : `<div class="muted">Задача <b>${esc(t.snum + t.letter)}. ${esc(t.title)}</b> → коммит в <code>master</code> и push на GitHub. Грейдер проверит её на скрытых тестах.</div>`}
       ${pf.errors.map((x) => `<div class="note err">${esc(x)}</div>`).join('')}
       ${pf.lock && pf.lock.stale ? '<div style="margin:6px 0"><button class="btn sm" data-unlock>Убрать зависшую блокировку</button></div>' : ''}
-      ${notTested ? `<div class="note warn">${lastLocal ? `Последний локальный прогон: ${esc(vname(lastLocal.verdict))}.` : 'Открытые тесты ещё не запускались.'} Можно отправить и так, но лучше сначала ▶.</div>` : ''}
+      ${notTested ? `<div class="note warn">${lastLocal ? `Последний локальный прогон: ${esc(vname(lastLocal.verdict))}.` : pf.project ? '<code>make test</code> ещё не запускался.' : 'Открытые тесты ещё не запускались.'} Можно отправить и так, но лучше сначала ▶.</div>` : ''}
       ${hasChanges ? `
-        <div class="section-label" style="margin-top:12px">Что уйдёт в коммит — только файлы этой задачи</div>
+        <div class="section-label" style="margin-top:12px">${pf.project ? 'Что уйдёт в коммит' : 'Что уйдёт в коммит — только файлы этой задачи'}</div>
         <div class="flist">${pf.files.map((f) => `
           <label><input type="checkbox" data-f="${esc(f.path)}" ${f.selected ? 'checked' : ''} ${f.protected ? 'disabled' : ''}>
             <span class="fpath grow">${esc(f.rel)}</span>
             ${f.binary ? '<span class="fst" title="Бинарник/артефакт сборки — обычно не нужен">бинарный</span>' : f.artifact ? '<span class="fst">артефакт</span>' : ''}
             ${f.protected ? '<span class="fst">файл тестов</span>' : ''}
             <span class="fst ${f.status === 'новый' ? 'new' : f.status === 'удалён' ? 'del' : ''}">${esc(f.status)}</span></label>`).join('')}</div>
-        <div class="dim" style="font-size:12px">Если ничего не отметить, уйдёт пустой коммит — повторная проверка того, что уже лежит в репозитории.</div>`
+        ${pf.project ? '' : '<div class="dim" style="font-size:12px">Если ничего не отметить, уйдёт пустой коммит — повторная проверка того, что уже лежит в репозитории.</div>'}`
         : ''}
-      ${!anySelectable ? `<div class="note info">В решении нет изменений относительно последнего коммита. Можно отправить <b>повторную проверку</b> пустым коммитом — грейдер прогонит то, что уже лежит в репозитории.</div>` : ''}
+      ${pf.project && !anySelectable ? `<div class="note info">В проекте нет изменений. Если есть неотправленные коммиты — можно просто запушить их.</div>` : ''}
+      ${!pf.project && !anySelectable ? `<div class="note info">В решении нет изменений относительно последнего коммита. Можно отправить <b>повторную проверку</b> пустым коммитом — грейдер прогонит то, что уже лежит в репозитории.</div>` : ''}
       <div class="section-label">Сообщение коммита</div>
-      <div class="commit-msg">${esc(pf.message)}</div>
+      ${pf.message_editable
+        ? `<input class="text-input" id="sub-msg" value="${esc(pf.message)}" maxlength="200" placeholder="Что сделано, например: add bit writer">`
+        : `<div class="commit-msg">${esc(pf.message)}</div>`}
       ${pf.unpushed.length ? `<div class="note warn">Вместе с этим уйдут неотправленные коммиты:<br>${pf.unpushed.map((x) => `<span class="mono">${esc(x)}</span>`).join('<br>')}</div>` : ''}
       ${pf.warnings.map((x) => `<div class="note warn">${esc(x)}</div>`).join('')}
       <div id="sub-steps"></div>`;
@@ -2723,7 +2758,7 @@
       if (!b) return;
       b.disabled = true;
       try {
-        await api.post('/api/git/unlock');
+        await api.post('/api/git/unlock', { key });
         toast('Блокировка снята', 'Проверяю задачу заново…', 'ok');
         m.close();
         openSubmit();
@@ -2734,7 +2769,7 @@
     });
     const foot = document.createElement('div');
     foot.className = 'modal-foot';
-    foot.innerHTML = `<span class="dim" style="font-size:12px;margin-right:auto;align-self:center">Без подписей и соавторов — коммит только от тебя.</span>
+    foot.innerHTML = `<span class="dim" style="font-size:12px;margin-right:auto;align-self:center">${pf.project ? 'Бинарники и артефакты сборки не отмечены — в проекте их пушить нельзя.' : 'Без подписей и соавторов — коммит только от тебя.'}</span>
       <button class="btn" data-close>Отмена</button>
       <button class="btn success" id="sub-go" ${pf.errors.length ? 'disabled' : ''}></button>`;
     m.el.appendChild(foot);
@@ -2743,7 +2778,7 @@
     const checked = () => $$('input[data-f]', m.el).filter((i) => i.checked).map((i) => i.dataset.f);
     const label = () => {
       const n = checked().length;
-      go.innerHTML = `${ICON.send} ${n ? `Отправить (${n} ${plural(n, ['файл', 'файла', 'файлов'])})` : 'Отправить повторно'}`;
+      go.innerHTML = `${ICON.send} ${n ? `Отправить (${n} ${plural(n, ['файл', 'файла', 'файлов'])})` : pf.project ? 'Запушить' : 'Отправить повторно'}`;
     };
     label();
     m.el.addEventListener('change', (e) => { if (e.target.matches('input[data-f]')) label(); });
@@ -2760,7 +2795,10 @@
       let sha = null;
       let failed = null;
       try {
-        await api.stream('POST', '/api/submit', { key, files, allow_empty: files.length === 0 }, (ev) => {
+        const msgEl = $('#sub-msg', m.el);
+        const payload = { key, files, allow_empty: files.length === 0 };
+        if (msgEl) payload.message = msgEl.value;
+        await api.stream('POST', '/api/submit', payload, (ev) => {
           if (ev.type === 'step') add(`▸ ${ev.text}`);
           else if (ev.type === 'log') add(ev.text, 'dim');
           else if (ev.type === 'error') failed = ev;
@@ -2792,6 +2830,7 @@
       add(`✓ Отправлено: ${sha.slice(0, 7)}`, 's-ok');
       foot.innerHTML = '<button class="btn" data-close>Закрыть</button>';
       $$('[data-close]', foot).forEach((b) => b.addEventListener('click', () => m.close()));
+      if (pf.project) { toast('Проект запушен', `${sha.slice(0, 7)} → ${pf.branch}`, 'ok'); return; }
       watchJudge(sha, key, m);
     });
   }
@@ -2815,7 +2854,7 @@
       return false;
     }
     add(`✓ Отправлено: ${sha.slice(0, 7)}`, 's-ok');
-    watchJudge(sha, key, m);
+    if (!isProjectKey(key)) watchJudge(sha, key, m);
     return true;
   }
 

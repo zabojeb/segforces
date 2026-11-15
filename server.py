@@ -255,11 +255,19 @@ def config_dir():
 
 SESSION_RE = re.compile(r"^Session(\d+)$")
 TASK_KEY_RE = re.compile(r"^Session\d+/[A-Za-z0-9_.\-]+$")
+# Course projects live in their own git repos outside Practice-*; they show up as "Project/<name>".
+PROJECT_SESSION = "Project"
+PROJECT_KEY_RE = re.compile(r"^Project/[A-Za-z0-9_.\-]+$")
+
+
+def is_project_key(key):
+    return bool(key) and bool(PROJECT_KEY_RE.match(key))
 HIDDEN_DIRS = {
     "open_tests", ".hidden_tests", "hidden_tests", ".git", "__pycache__", ".idea", ".vscode",
     "thirdparty", "third_party", "node_modules", "cmake_build", ".cache",
 }
-HIDDEN_FILES = {"run_test.sh", "run_tests.sh", "YOUR_CODE_HERE", ".DS_Store", ".gitkeep"}
+HIDDEN_FILES = {"run_test.sh", "run_tests.sh", "YOUR_CODE_HERE", "YOUR_SOURCES_HERE", "YOUR_HEADERS_HERE", "YOUR_TESTS_HERE",
+                ".DS_Store", ".gitkeep"}
 PROTECTED_TOP = {"open_tests", ".hidden_tests", "hidden_tests", ".git"}
 MAX_TEXT = 1024 * 1024
 ARTIFACT_RE = re.compile(
@@ -357,6 +365,7 @@ class Repo:
         self._titles = {}
         self._health = None
         self._health_at = 0.0
+        self.projects = []  # [{"name", "path", "points", "deadline"}] from config
 
     def health(self, force=False):
         """Can we actually read files? A stuck cloud-sync provider can make every read hang."""
@@ -435,6 +444,9 @@ class Repo:
             })
         if readmes and healthy:
             self._load_titles(readmes)
+        project = self.project_session()
+        if project:
+            sessions.append(project)
         with self.lock:
             self._sessions = sessions
             self._sessions_at = time.time()
@@ -462,11 +474,56 @@ class Repo:
                 task["title"] = title
         pool.shutdown(wait=False)
 
+    # -- projects (separate repos) -----------------------------------------
+    def project(self, key):
+        name = key.split("/", 1)[1] if is_project_key(key) else None
+        return next((p for p in self.projects if p["name"] == name), None)
+
+    def project_dir(self, key):
+        p = self.project(key)
+        if not p:
+            raise ApiError(404, "Проект %s не найден" % key)
+        pdir = Path(p["path"]).expanduser().resolve()
+        if not pdir.is_dir():
+            raise ApiError(404, "Папка проекта не найдена: %s" % pdir)
+        return pdir
+
+    def is_project_dir(self, tdir):
+        tdir = Path(tdir).resolve()
+        return any(Path(p["path"]).expanduser().resolve() == tdir for p in self.projects)
+
+    def project_session(self):
+        tasks = []
+        for i, p in enumerate(self.projects):
+            key = "%s/%s" % (PROJECT_SESSION, p["name"])
+            pdir = Path(p["path"]).expanduser()
+            title = self._titles.get(key)
+            if not title:
+                readme = self.find_readme(pdir) if pdir.is_dir() else None
+                try:
+                    title = readme_title(read_text(readme, 4096), None) if readme else None
+                except OSError:
+                    title = None
+                if title:
+                    self._titles[key] = title
+            tasks.append({
+                "key": key, "session": PROJECT_SESSION, "snum": "P", "letter": str(i + 1) if len(self.projects) > 1 else "",
+                "name": p["name"], "title": title or p["name"].replace("_", " ").capitalize(),
+                "points": p.get("points"), "id": None, "deadline": p.get("deadline"),
+                "exists": pdir.is_dir(), "project": True,
+            })
+        if not tasks:
+            return None
+        deadlines = [t["deadline"] for t in tasks if t["deadline"]]
+        return {"name": PROJECT_SESSION, "num": None, "project": True, "tasks": tasks,
+                "deadline": min(deadlines) if deadlines else None,
+                "points": sum(t["points"] or 0 for t in tasks)}
+
     def all_tasks(self):
         return [t for s in self.sessions() for t in s["tasks"]]
 
     def task(self, key):
-        if not key or not TASK_KEY_RE.match(key):
+        if not key or not (TASK_KEY_RE.match(key) or is_project_key(key)):
             raise ApiError(400, "Некорректный ключ задачи: %r" % key)
         for t in self.all_tasks():
             if t["key"] == key:
@@ -475,6 +532,8 @@ class Repo:
 
     def task_dir(self, key):
         self.task(key)
+        if is_project_key(key):
+            return self.project_dir(key)
         root = self.root.resolve()  # re-resolved: the repo may have been moved behind a symlink
         tdir = (root / key).resolve()
         if not str(tdir).startswith(str(root) + os.sep) or not tdir.is_dir():
@@ -492,6 +551,10 @@ class Repo:
         return None
 
     def runner(self, tdir):
+        if self.is_project_dir(tdir):
+            # A project is checked with its own Makefile: `make test` right in the project folder.
+            return {"docker": False, "image": None, "mounts": [], "script": "make test",
+                    "argv": ["make", "test"], "project": True}
         for name in ("run_test.sh", "run_tests.sh"):
             p = tdir / name
             if p.is_file():
@@ -632,7 +695,8 @@ class Repo:
                     f["hash"] = sha1(read_bytes(tdir / f["path"]))
                 except OSError:
                     f["hash"] = None
-        expected = self.expected_files(tdir, statement, runner)
+        # A project's ReadMe names example files (main.c, archive.c) without their src/ folder.
+        expected = [] if is_project_key(key) else self.expected_files(tdir, statement, runner)
         kinds = set(f["lang"] for f in files) | set(lang_for(e["path"]) for e in expected)
         if runner and any(e["path"] == "src" for e in expected):
             kinds.add("c")
@@ -689,7 +753,7 @@ HINT_RULES = [
     (r"Cannot connect to the Docker daemon|Is the docker daemon running|docker daemon is not running|error during connect",
      "warn", "Docker не запущен", "Тесты гоняются в контейнере. Запусти Docker Desktop и повтори.", "start_docker"),
     (r"No rule to make target '([^']+)'", "error", "Нет цели в Makefile",
-     "make не знает, как получить `{0}`. Проверь имена целей в `Makefile.Student` (`build`, `clean`, имя библиотеки…).", None),
+     "make не знает, как получить `{0}`. Проверь имена целей в Makefile (`build`, `test`, `clean`, имя библиотеки…).", None),
     (r"\*\*\* missing separator", "error", "Пробелы вместо TAB в Makefile",
      "Команды рецепта в Makefile должны начинаться с табуляции, а не с пробелов.", None),
     (r"undefined reference to `([^']+)'", "error", "Ошибка линковки",
@@ -1132,6 +1196,12 @@ class Runner:
             problems.append({"level": "error", "title": "Нет run_test.sh",
                              "text": "В папке задачи нет скрипта запуска тестов.", "action": None})
             return problems
+        if runner.get("project"):
+            if not any((tdir / n).is_file() for n in ("Makefile", "makefile", "GNUmakefile")):
+                problems.append({"level": "error", "title": "Нет Makefile",
+                                 "text": "Проект проверяется командой `make test` — создай в корне проекта `Makefile` с целью `test`.",
+                                 "action": "create:Makefile"})
+            return problems
         for src, _dst in runner.get("mounts") or []:
             src = src.strip("/")
             if not src or src.split("/")[0] in PROTECTED_TOP:
@@ -1213,7 +1283,7 @@ class Runner:
         timeout = self.app.args.run_timeout
         try:
             run.proc = subprocess.Popen(
-                ["bash", runner["script"]], cwd=str(tdir), env=env, stdin=subprocess.DEVNULL,
+                runner.get("argv") or ["bash", runner["script"]], cwd=str(tdir), env=env, stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True)
         except OSError as exc:
             self._emit(run, "Не удалось запустить тесты: %s" % exc)
@@ -1318,6 +1388,16 @@ class Runner:
     def _verdict(self, run, code, tdir, runner):
         output = "\n".join(run.lines)
         res = analyze(output, code, run.timed_out, run.cancelled)
+        if runner and runner.get("project"):
+            # `make test` reports any failed test as "make: *** [test] Error N"; without gcc errors
+            # that is a failed test, not a build failure.
+            if res["verdict"] == "CE" and not GCC_ERR.search(output) and "undefined reference to" not in output:
+                res["verdict"], res["verdict_name"] = "WA", VERDICT_NAMES["WA"]
+                res["note"] = "make test завершился с ошибкой — смотри вывод тестов"
+                res.pop("compile_errors", None)
+            elif res["verdict"] == "AC" and not res.get("total"):
+                res["note"] = "make test прошёл (код возврата 0)"
+            return res
         missing_bin = bool(re.search(r"No such file or directory|not found", output))
         if (tdir is not None and runner and not run.cancelled and not run.timed_out
                 and (res["verdict"] in ("RE", "JE") or (res["verdict"] == "WA" and missing_bin))):
@@ -1737,6 +1817,133 @@ class Git:
         return sha.strip()
 
 
+class ProjectGit(Git):
+    """Git of a project repo: the whole repo is the "task", any branch, a free-form commit message,
+    no grader. Build artifacts and binaries are never preselected (projects forbid binaries in HEAD)."""
+
+    DEFAULT_MESSAGE = "Update project"
+
+    def __init__(self, root, key):
+        super().__init__(root)
+        self.key = key
+
+    def task_changes(self, key):
+        code, out, err = self.run(["status", "--porcelain=v1", "-z", "--untracked-files=all"], timeout=240)
+        if code != 0:
+            raise ApiError(500, "git status не отработал: %s" % (err or out)[-400:], hint=self.timeout_hint(code))
+        files = []
+        for xy, path in parse_porcelain_z(out):
+            full = self.root / path
+            deleted = "D" in xy
+            binary = (not deleted) and full.is_file() and is_binary(full)
+            artifact = binary or bool(ARTIFACT_RE.search(path))
+            protected = path.split("/")[0] == ".git"
+            label_key = xy.strip()[:1] or "?"
+            files.append({
+                "path": path, "rel": path, "xy": xy, "status": STATUS_LABELS.get(label_key, xy.strip()),
+                "binary": binary, "artifact": artifact, "protected": protected,
+                "selected": not (artifact or protected),
+                "exec": (not deleted) and full.is_file() and bool(full.stat().st_mode & 0o111),
+            })
+        return files
+
+    def upstream(self):
+        branch = self.head_branch() or "master"
+        return branch, "origin/%s" % branch
+
+    def preflight(self, key):
+        branch, upstream = self.upstream()
+        errors, warnings = [], []
+        if not self.head_branch():
+            errors.append("HEAD не указывает на ветку (detached HEAD). Переключись на ветку: `git switch master`.")
+        if not self.origin_url():
+            errors.append("У репозитория проекта нет remote origin — некуда пушить. "
+                          "Подключи свой репозиторий: `git remote add origin <url>`.")
+        lock = self.lock_state()
+        if lock:
+            errors.append("Git заблокирован (.git/index.lock).")
+        files = self.task_changes(key)
+        ahead = behind = 0
+        unpushed = []
+        fcode = 1
+        if self.origin_url():
+            fcode, _fo, _fe = self.run(["fetch", "--quiet", "origin"], timeout=30)
+            code, ab, _e = self.run(["rev-list", "--left-right", "--count", "HEAD...%s" % upstream], timeout=60)
+            if code == 0 and ab.strip():
+                try:
+                    ahead, behind = [int(x) for x in ab.split()[:2]]
+                except ValueError:
+                    pass
+            if ahead:
+                code, lg, _e = self.run(["log", "--format=%h %s", "%s..HEAD" % upstream], timeout=60)
+                unpushed = [ln for ln in lg.splitlines() if ln.strip()][:20]
+        if behind:
+            errors.append("На GitHub есть %d коммит(ов), которых нет локально. Сначала подтяни их: `git pull --rebase`." % behind)
+        if ahead:
+            warnings.append("Есть %d неотправленных коммит(ов) — они уйдут вместе с этим." % ahead)
+        if self.origin_url() and fcode != 0:
+            warnings.append("Не получилось сделать git fetch (нет сети или ветки ещё нет на GitHub).")
+        binaries = [f["rel"] for f in files if f["artifact"] and "D" not in f["xy"]]
+        if binaries:
+            warnings.append("Бинарники и артефакты сборки не отмечены — их нельзя пушить: %s. "
+                            "Добавь их в .gitignore." % ", ".join(binaries[:8]))
+        return {
+            "key": key, "branch": branch, "files": files, "message": self.DEFAULT_MESSAGE,
+            "message_editable": True, "project": True,
+            "errors": errors, "warnings": warnings, "ahead": ahead, "behind": behind, "lock": lock,
+            "unpushed": unpushed, "staged_other": [], "remote": self.origin_url(),
+        }
+
+    def submit(self, key, paths, allow_empty, emit, message=None):
+        if not self.lock.acquire(blocking=False):
+            raise ApiError(409, "Уже идёт другая отправка")
+        try:
+            if not self.head_branch():
+                raise ApiError(409, "HEAD не указывает на ветку")
+            if not self.origin_url():
+                raise ApiError(409, "У репозитория проекта нет remote origin")
+            allowed = {f["path"] for f in self.task_changes(key) if not f["protected"]}
+            clean = []
+            for p in paths or []:
+                if not isinstance(p, str) or p not in allowed:
+                    raise ApiError(400, "Файл %r не входит в изменения проекта — отправка отменена" % (p,))
+                if p not in clean:
+                    clean.append(p)
+            message = (message or "").strip() or self.DEFAULT_MESSAGE
+            if clean:
+                emit({"type": "step", "text": "git add (%d файл.)" % len(clean)})
+                code, out, err = self.run(["add", "-A", "--"] + clean, timeout=240)
+                if code != 0:
+                    raise self.lock_error(err + out) or ApiError(500, "git add: %s" % (err or out)[-600:])
+                emit({"type": "step", "text": "git commit — только выбранные файлы"})
+                code, out, err = self.run(["commit", "-F", "-", "--"] + clean, timeout=240, input_text=message + "\n")
+                if code != 0:
+                    raise self.lock_error(err + out) or ApiError(500, "git commit: %s" % (err or out)[-600:])
+                emit({"type": "log", "text": out.strip()})
+            elif not allow_empty:
+                raise ApiError(400, "Нечего отправлять: в проекте нет изменений")
+            return self.push(emit)
+        finally:
+            self.lock.release()
+
+    def push(self, emit):
+        branch = self.head_branch() or "master"
+        emit({"type": "step", "text": "git push origin %s" % branch})
+        code, out, err = self.run(["push", "-u", "origin", branch], timeout=240)
+        text = (out + "\n" + err).strip()
+        if text:
+            emit({"type": "log", "text": text})
+        if code != 0:
+            hint = self.timeout_hint(code)
+            if "rejected" in text or "fetch first" in text or "non-fast-forward" in text:
+                hint = "На GitHub есть коммиты, которых нет у тебя. Сделай `git pull --rebase` и отправь снова (коммит уже создан локально)."
+            elif "Permission" in text or "denied" in text or "403" in text:
+                hint = "Нет прав на push в этот репозиторий. Проверь, что origin — это твой репозиторий проекта."
+            raise ApiError(500, "git push не прошёл", hint=hint, log=text[-2000:], committed=True)
+        code, sha, _e = self.run(["rev-parse", "HEAD"], timeout=60)
+        return sha.strip()
+
+
 # ---------------------------------------------------------------------------
 # judge: GitHub Actions grader results via the gh CLI
 # ---------------------------------------------------------------------------
@@ -1946,7 +2153,14 @@ SYSTEM_PROMPT_BASE = """Ты — Claude, наставник в SegForces: лок
 - Отвечай по-русски, по делу, без воды. Используй markdown; код — в блоках ```bash / ```c / ```makefile.
 - Файлы задачи можно читать (Read/Grep/Glob), изменять и запускать — нет: правки вносит сам студент в редакторе.
 - Тесты гоняются в Docker (Debian: bash 5, GNU coreutils/findutils/grep/sed, gcc, make, python3), а не на macOS студента. Учитывай разницу BSD/GNU и bash 3.2/5.
-- Открытые тесты лежат в open_tests/. Скрытые недоступны — не выдумывай их содержимое, но можешь предполагать, какие граничные случаи там вероятны.
+- Открытые тесты лежат в open_tests/. Скрытые недоступны — не выдумывай их содержимое.
+
+Строго по условию (ГЛАВНОЕ правило):
+- Единственный источник требований — условие задачи (ReadMe) и файлы в open_tests/. Перед ответом сверься с ними; если нужно — перечитай ReadMe через Read.
+- Не придумывай требований, форматов вывода, входных данных, тест-кейсов и граничных случаев, которых нет в условии или открытых тестах. Не добавляй в решение обработку того, чего условие не требует.
+- Опираясь на требование, ссылайся на него: процитируй короткую фразу из ReadMe или назови файл теста.
+- Если условие что-то не уточняет — прямо скажи «в условии это не указано» и не додумывай поведение. Можешь отметить это одной строкой как вопрос к преподавателю, но не меняй под это решение.
+- Если код студента делает что-то сверх условия — не хвали и не развивай это; при необходимости скажи, что этого условие не требует.
 - Если видишь вывод упавших тестов — объясни причину простыми словами и укажи место в коде (файл и строку).
 - Студент сдаёт решение кнопкой «Отправить» (коммит GRADER в master). Не предлагай коммитить что-то кроме файлов решения."""
 
@@ -1954,7 +2168,7 @@ SYSTEM_PROMPT_MODES = {
     "hint": """РЕЖИМ: ПОДСКАЗКИ.
 Не пиши готовое решение задачи целиком и не переписывай код студента полностью. Давай наводящие подсказки, задавай вопросы, указывай, где ошибка и почему, объясняй нужные концепции и команды. Короткие фрагменты (до ~5 строк), иллюстрирующие идею, — можно. Если студент прямо просит полное решение — напомни, что можно переключить режим на «Полный разбор» в шапке чата.""",
     "full": """РЕЖИМ: ПОЛНЫЙ РАЗБОР.
-Можно дать полное решение, но объясни каждую часть, чтобы студент понял, а не просто скопировал. Укажи, какие граничные случаи учтены.""",
+Можно дать полное решение, но объясни каждую часть, чтобы студент понял, а не просто скопировал. Решение должно делать ровно то, что написано в условии, — ни больше ни меньше. Если упоминаешь граничные случаи, то только те, что явно есть в условии или в открытых тестах, со ссылкой на них.""",
 }
 
 MODEL_CHOICES = {"", "sonnet", "opus", "haiku", "fable"}
@@ -2027,9 +2241,15 @@ class Helper:
             parts.append("# Задача %s — %s\nБаллы: %s · дедлайн: %s" % (
                 key, detail["title"], detail.get("points") or "?", detail.get("deadline") or "?"))
             parts.append("## Условие (%s)\n%s" % (detail.get("readme") or "ReadMe.md", detail["statement"].strip()))
-            tests = ", ".join(t["path"] for t in detail["tests"]) or "нет"
-            parts.append("## Как проверяется\nОткрытые тесты: %s (можешь прочитать). Запуск тестов: `%s`." % (
-                tests, (detail.get("runner") or {}).get("script", "run_test.sh")))
+            if is_project_key(key):
+                parts.append("## Как проверяется\nЭто курсовой проект в отдельном репозитории, а не обычная задача: "
+                             "открытых тестов и грейдера нет, тесты пишет сам студент, запуск — `make test` в корне проекта. "
+                             "Оценивают по критериям из условия (Marking criteria). Код обязан следовать Style.md "
+                             "из корня проекта — прочитай его перед тем, как предлагать код.")
+            else:
+                tests = ", ".join(t["path"] for t in detail["tests"]) or "нет"
+                parts.append("## Как проверяется\nОткрытые тесты: %s (можешь прочитать). Запуск тестов: `%s`." % (
+                    tests, (detail.get("runner") or {}).get("script", "run_test.sh")))
         if payload.get("include_code", True):
             snap = self.code_snapshot(key, detail)
             h = sha1(snap)
@@ -2414,10 +2634,12 @@ class App:
         repo = Repo(path)
         data_dir = Path(self.args.data_dir) if self.args.data_dir else default_data_dir(repo.root)
         data_dir.mkdir(parents=True, exist_ok=True)
+        repo.projects = self.project_list()
         with self.lock:
             self.repo = repo
             self.data_dir = data_dir
             self.git = Git(repo.root)
+            self.project_gits = {}
             self.slug = self.args.slug or slug_from_url(self.git.origin_url())
             self.state = JsonStore(data_dir / "state.json", {"runs": {}, "submissions": []})
             self.runner = Runner(self)
@@ -2427,6 +2649,25 @@ class App:
             self.env.cache = None
         log("репозиторий:", repo.root, "| GitHub:", self.slug or "—")
         threading.Thread(target=lambda: self.judge.sync(force=True), daemon=True).start()
+
+    def project_list(self):
+        """Projects from config: [{"name": "huffman", "path": "~/Huffman", "points": 100, "deadline": "2026-11-16"}]."""
+        out = []
+        for p in self.config.data.get("projects") or []:
+            if isinstance(p, dict) and isinstance(p.get("name"), str) and isinstance(p.get("path"), str) \
+                    and re.fullmatch(r"[A-Za-z0-9_.\-]+", p["name"]):
+                out.append(p)
+        return out
+
+    def git_for(self, key):
+        """Git of the course repo, or of the project's own repo for Project/<name> keys."""
+        if not is_project_key(key):
+            return self.git
+        with self.lock:
+            g = self.project_gits.get(key)
+            if g is None:
+                g = self.project_gits[key] = ProjectGit(self.repo.project_dir(key), key)
+            return g
 
     # -- local run history -------------------------------------------------
     def state_add_run(self, key, run):
@@ -2758,6 +2999,9 @@ def r_exec(h, query, body):
 def r_submit_preflight(h, query, body):
     key = body.get("key")
     h.app.repo.task(key)
+    if is_project_key(key):
+        h.send_json(h.app.git_for(key).preflight(key))
+        return
     if not h.app.slug:
         raise ApiError(409, "У репозитория нет remote origin на GitHub")
     require_readable_repo(h.app)
@@ -2798,6 +3042,14 @@ def r_submit(h, query, body):
     paths = body.get("files") or []
     if not isinstance(paths, list):
         raise ApiError(400, "files должен быть списком")
+    if is_project_key(key):
+        git = app.git_for(key)
+        message = body.get("message") if isinstance(body.get("message"), str) else None
+        sha = _submit_common(h, lambda emit: git.submit(key, paths, bool(body.get("allow_empty")), emit, message))
+        if sha:
+            log("[push]", key, sha[:8])
+            h.emit({"type": "done", "sha": sha, "key": key, "project": True})
+        return
     sha = _submit_common(h, lambda emit: app.git.submit(key, paths, bool(body.get("allow_empty")), emit))
     if sha:
         sub = {"key": key, "sha": sha, "at": time.time(),
@@ -2813,7 +3065,8 @@ def r_submit(h, query, body):
 
 @route("POST", "/api/git/unlock")
 def r_git_unlock(h, query, body):
-    git = h.app.git
+    key = body.get("key")
+    git = h.app.git_for(key) if is_project_key(key) else h.app.git
     st = git.lock_state()
     if st is None:
         h.send_json({"ok": True, "removed": False})
@@ -2833,16 +3086,19 @@ def r_submit_push(h, query, body):
     app = h.app
     key = body.get("key")
     app.repo.task(key)
+    git = app.git_for(key)
 
     def do(emit):
-        if not app.git.lock.acquire(blocking=False):
+        if not git.lock.acquire(blocking=False):
             raise ApiError(409, "Уже идёт отправка")
         try:
-            return app.git.push(emit)
+            return git.push(emit)
         finally:
-            app.git.lock.release()
+            git.lock.release()
     sha = _submit_common(h, do)
-    if sha:
+    if sha and is_project_key(key):
+        h.emit({"type": "done", "sha": sha, "key": key, "project": True})
+    elif sha:
         with app.state.lock:
             app.state.data.setdefault("submissions", []).append({
                 "key": key, "sha": sha, "at": time.time(),
